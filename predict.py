@@ -74,23 +74,62 @@ class Predictor(BasePredictor):
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
+    def show_anns(self, anns, obj_ids):
+        if len(anns) == 0:
+            return
+        ax = plt.gca()
+        ax.set_autoscale_on(False)
+
+        img = np.zeros((*anns[0].shape[-2:], 4))
+        img[:, :, 3] = 0
+
+        cmap = plt.get_cmap("tab10")
+        for ann, obj_id in zip(anns, obj_ids):
+            m = ann.squeeze().astype(bool)
+            color = np.array([*cmap(obj_id % 10)[:3], 0.6])
+            img[m] = color
+        ax.imshow(img)
+
+    def show_points(self, coords, labels, ax, marker_size=375):
+        pos_points = coords[labels == 1]
+        neg_points = coords[labels == 0]
+        ax.scatter(
+            pos_points[:, 0],
+            pos_points[:, 1],
+            color="green",
+            marker="*",
+            s=marker_size,
+            edgecolor="white",
+            linewidth=1.25,
+        )
+        ax.scatter(
+            neg_points[:, 0],
+            neg_points[:, 1],
+            color="red",
+            marker="*",
+            s=marker_size,
+            edgecolor="white",
+            linewidth=1.25,
+        )
+
     def predict(
         self,
-        video: Path = Input(description="Input video file"),
-        clicks: str = Input(
+        input_video: Path = Input(description="Path to the input video file"),
+        click_coordinates: str = Input(
             description="List of click coordinates in format '[x,y],[x,y],...'"
         ),
-        labels: str = Input(
-            description="List of labels corresponding to clicks, e.g., '1,1,0,1'"
+        click_labels: str = Input(
+            description="List of click types (1 for foreground, 0 for background), e.g., '1,1,0,1'"
         ),
-        affected_frames: str = Input(
+        click_frames: str = Input(
             description="List of frame indices for each click, e.g., '0,0,150,0'"
         ),
-        ann_obj_ids: str = Input(
-            description="List of object IDs corresponding to each click, e.g., '1,1,1,2'"
+        click_object_ids: str = Input(
+            description="List of object IDs for each click, e.g., '1,1,1,2'"
         ),
-        vis_frame_stride: int = Input(
-            default=15, description="Stride for visualizing frames"
+        output_frame_interval: int = Input(
+            default=1,
+            description="Interval for output frame visualization (1 = every frame, 2 = every other frame, etc.)",
         ),
     ) -> Output:
 
@@ -98,7 +137,7 @@ class Predictor(BasePredictor):
         os.makedirs(video_dir, exist_ok=True)
 
         ffmpeg_command = (
-            f"ffmpeg -i {video} -q:v 2 -start_number 0 {video_dir}/%05d.jpg"
+            f"ffmpeg -i {input_video} -q:v 2 -start_number 0 {video_dir}/%05d.jpg"
         )
         subprocess.run(ffmpeg_command, shell=True, check=True)
 
@@ -113,29 +152,32 @@ class Predictor(BasePredictor):
 
         click_list = [
             list(map(int, click.split(",")))
-            for click in clicks.strip("[]").split("],[")
+            for click in click_coordinates.strip("[]").split("],[")
         ]
-        label_list = list(map(int, labels.split(",")))
-        frame_list = list(map(int, affected_frames.split(",")))
-        obj_id_list = list(map(int, ann_obj_ids.split(",")))
+        click_type_list = list(map(int, click_labels.split(",")))
+        frame_list = list(map(int, click_frames.split(",")))
+        obj_id_list = list(map(int, click_object_ids.split(",")))
 
         if not (
-            len(click_list) == len(label_list) == len(frame_list) == len(obj_id_list)
+            len(click_list)
+            == len(click_type_list)
+            == len(frame_list)
+            == len(obj_id_list)
         ):
             raise ValueError(
-                "The number of clicks, labels, affected frames, and object IDs must be the same."
+                "The number of clicks, click types, click frames, and object IDs must be the same."
             )
 
         output_dir = Path("predict_outputs")
         output_dir.mkdir(exist_ok=True)
 
         prompts = {}
-        for i, (click, label, frame, obj_id) in enumerate(
-            zip(click_list, label_list, frame_list, obj_id_list)
+        for i, (click, click_type, frame, obj_id) in enumerate(
+            zip(click_list, click_type_list, frame_list, obj_id_list)
         ):
             x, y = click
             points = np.array([[x, y]], dtype=np.float32)
-            labels = np.array([label], np.int32)
+            labels = np.array([click_type], np.int32)
 
             if obj_id not in prompts:
                 prompts[obj_id] = []
@@ -144,8 +186,12 @@ class Predictor(BasePredictor):
         video_segments = {}
         for obj_id, obj_prompts in prompts.items():
             for frame, points, labels in obj_prompts:
-                out_obj_ids, out_mask_logits = self.refine_mask(
-                    inference_state, frame, obj_id, points, labels
+                _, out_obj_ids, out_mask_logits = self.predictor.add_new_points(
+                    inference_state=inference_state,
+                    frame_idx=frame,
+                    obj_id=obj_id,
+                    points=points,
+                    labels=labels,
                 )
 
                 if frame not in video_segments:
@@ -179,7 +225,7 @@ class Predictor(BasePredictor):
         # Visualize results
         black_white_masks = []
         highlighted_frames = []
-        for out_frame_idx in range(0, len(frame_names), vis_frame_stride):
+        for out_frame_idx in range(0, len(frame_names), output_frame_interval):
             fig = plt.figure(figsize=(12, 8))
             plt.title(f"frame {out_frame_idx}")
             plt.imshow(Image.open(os.path.join(video_dir, frame_names[out_frame_idx])))
@@ -221,52 +267,4 @@ class Predictor(BasePredictor):
 
         return Output(
             black_white_masks=black_white_masks, highlighted_frames=highlighted_frames
-        )
-
-    def refine_mask(self, inference_state, frame_idx, obj_id, points, labels):
-        _, out_obj_ids, out_mask_logits = self.predictor.add_new_points(
-            inference_state=inference_state,
-            frame_idx=frame_idx,
-            obj_id=obj_id,
-            points=points,
-            labels=labels,
-        )
-        return out_obj_ids, out_mask_logits
-
-    def show_anns(self, anns, obj_ids):
-        if len(anns) == 0:
-            return
-        ax = plt.gca()
-        ax.set_autoscale_on(False)
-
-        img = np.zeros((*anns[0].shape[-2:], 4))
-        img[:, :, 3] = 0
-
-        cmap = plt.get_cmap("tab10")
-        for ann, obj_id in zip(anns, obj_ids):
-            m = ann.squeeze().astype(bool)
-            color = np.array([*cmap(obj_id % 10)[:3], 0.6])
-            img[m] = color
-        ax.imshow(img)
-
-    def show_points(self, coords, labels, ax, marker_size=375):
-        pos_points = coords[labels == 1]
-        neg_points = coords[labels == 0]
-        ax.scatter(
-            pos_points[:, 0],
-            pos_points[:, 1],
-            color="green",
-            marker="*",
-            s=marker_size,
-            edgecolor="white",
-            linewidth=1.25,
-        )
-        ax.scatter(
-            neg_points[:, 0],
-            neg_points[:, 1],
-            color="red",
-            marker="*",
-            s=marker_size,
-            edgecolor="white",
-            linewidth=1.25,
         )
