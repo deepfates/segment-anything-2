@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image
 from typing import List, Iterator
 import matplotlib.pyplot as plt
-from cog import BasePredictor, Input, Path, BaseModel
+from cog import BasePredictor, Input, Path, BaseModel, ConcatenateIterator
 
 mimetypes.add_type("image/webp", ".webp")
 
@@ -89,28 +89,6 @@ class Predictor(BasePredictor):
             img[m] = color
         ax.imshow(img)
 
-    def show_points(self, coords, labels, ax, marker_size=375):
-        pos_points = coords[labels == 1]
-        neg_points = coords[labels == 0]
-        ax.scatter(
-            pos_points[:, 0],
-            pos_points[:, 1],
-            color="green",
-            marker="*",
-            s=marker_size,
-            edgecolor="white",
-            linewidth=1.25,
-        )
-        ax.scatter(
-            neg_points[:, 0],
-            neg_points[:, 1],
-            color="red",
-            marker="*",
-            s=marker_size,
-            edgecolor="white",
-            linewidth=1.25,
-        )
-
     def predict(
         self,
         input_video: Path = Input(description="Path to the input video file"),
@@ -127,13 +105,12 @@ class Predictor(BasePredictor):
             description="List of object IDs for each click, e.g., '1,1,1,2'"
         ),
         output_frame_interval: int = Input(
-            default=1,
-            description="Interval for output frame visualization (1 = every frame, 2 = every other frame, etc.)",
+            default=1, description="Interval for output frame visualization"
         ),
         mask_type: str = Input(
             default="binary",
             choices=["binary", "highlighted"],
-            description="Choose the type of mask to return (binary or highlighted frames)",
+            description="Choose the type of mask to return",
         ),
         output_format: str = Input(
             description="The image file format of the generated output images",
@@ -141,29 +118,10 @@ class Predictor(BasePredictor):
             default="webp",
         ),
         output_quality: int = Input(
-            description="The image compression quality (for lossy formats like JPEG and WebP). 100 = best quality, 0 = lowest quality.",
-            default=80,
-            ge=0,
-            le=100,
+            description="The image compression quality", default=80, ge=0, le=100
         ),
     ) -> Iterator[Path]:
-
-        video_dir = "video_frames"
-        os.makedirs(video_dir, exist_ok=True)
-        ffmpeg_command = (
-            f"ffmpeg -i {input_video} -q:v 2 -start_number 0 {video_dir}/%05d.jpg"
-        )
-        subprocess.run(ffmpeg_command, shell=True, check=True)
-
-        frame_names = [
-            p
-            for p in os.listdir(video_dir)
-            if os.path.splitext(p)[-1].lower() in [".jpg", ".jpeg"]
-        ]
-        frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
-
-        inference_state = self.predictor.init_state(video_path=video_dir)
-
+        # 1. Parse inputs
         click_list = [
             list(map(int, click.split(",")))
             for click in click_coordinates.strip("[]").split("],[")
@@ -182,12 +140,30 @@ class Predictor(BasePredictor):
                 "The number of clicks, click types, click frames, and object IDs must be the same."
             )
 
-        output_dir = Path("predict_outputs")
-        output_dir.mkdir(exist_ok=True)
+        # 2. Extract video frames
+        video_dir = "video_frames"
+        os.makedirs(video_dir, exist_ok=True)
+        ffmpeg_command = (
+            f"ffmpeg -i {input_video} -q:v 2 -start_number 0 {video_dir}/%05d.jpg"
+        )
+        subprocess.run(ffmpeg_command, shell=True, check=True)
 
+        frame_names = sorted(
+            [
+                p
+                for p in os.listdir(video_dir)
+                if os.path.splitext(p)[-1].lower() in [".jpg", ".jpeg"]
+            ],
+            key=lambda p: int(os.path.splitext(p)[0]),
+        )
+
+        # 3. Initialize SAM predictor
+        inference_state = self.predictor.init_state(video_path=video_dir)
+
+        # 4. Process clicks and generate prompts
         prompts = {}
-        for i, (click, click_type, frame, obj_id) in enumerate(
-            zip(click_list, click_type_list, frame_list, obj_id_list)
+        for click, click_type, frame, obj_id in zip(
+            click_list, click_type_list, frame_list, obj_id_list
         ):
             x, y = click
             points = np.array([[x, y]], dtype=np.float32)
@@ -197,6 +173,7 @@ class Predictor(BasePredictor):
                 prompts[obj_id] = []
             prompts[obj_id].append((frame, points, labels))
 
+        # 5. Perform segmentation
         video_segments = {}
         for obj_id, obj_prompts in prompts.items():
             for frame, points, labels in obj_prompts:
@@ -212,7 +189,7 @@ class Predictor(BasePredictor):
                     video_segments[frame] = {}
                 video_segments[frame][obj_id] = out_mask_logits[0].cpu().numpy()
 
-        # Propagate masks
+        # 6. Propagate masks
         for (
             out_frame_idx,
             out_obj_ids,
@@ -225,15 +202,18 @@ class Predictor(BasePredictor):
                     out_mask_logits[i].cpu().numpy()
                 )
 
-        # Generate and yield results
+        # 7. Generate and yield results
+        output_dir = Path("predict_outputs")
+        output_dir.mkdir(exist_ok=True)
+
         for out_frame_idx in range(0, len(frame_names), output_frame_interval):
+            # Combine masks for all objects in the current frame
             combined_mask = np.zeros_like(
                 next(iter(video_segments[out_frame_idx].values())).squeeze(),
                 dtype=np.float32,
             )
-            for out_obj_id, out_mask in video_segments[out_frame_idx].items():
-                mask = out_mask.squeeze()
-                combined_mask = np.maximum(combined_mask, mask)
+            for out_mask in video_segments[out_frame_idx].values():
+                combined_mask = np.maximum(combined_mask, out_mask.squeeze())
 
             # Apply threshold to get final binary mask
             final_mask = (combined_mask > 0.0).astype(np.uint8)
@@ -258,21 +238,19 @@ class Predictor(BasePredictor):
                 )
                 self.show_anns([final_mask], [1])  # Use a single color for all objects
 
-                # Save figure to a bytes buffer
                 buf = io.BytesIO()
                 plt.savefig(
                     buf, format="png", dpi="figure", bbox_inches="tight", pad_inches=0
                 )
                 buf.seek(0)
 
-                # Open the buffer with PIL and save with desired format and quality
                 img = Image.open(buf)
                 self.save_image(img, output_path, output_format, output_quality)
 
                 plt.close(fig)
                 yield output_path
 
-        # Cleanup
+        # 8. Cleanup
         for file in os.listdir(video_dir):
             os.remove(os.path.join(video_dir, file))
         os.rmdir(video_dir)
