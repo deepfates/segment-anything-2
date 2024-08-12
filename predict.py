@@ -109,7 +109,7 @@ class Predictor(BasePredictor):
         ),
         mask_type: str = Input(
             default="binary",
-            choices=["binary", "highlighted"],
+            choices=["binary", "highlighted", "greenscreen"],
             description="Choose the type of mask to return",
         ),
         output_format: str = Input(
@@ -140,25 +140,24 @@ class Predictor(BasePredictor):
                 "The number of clicks, click types, click frames, and object IDs must be the same."
             )
 
-        # 2. Extract video frames
-        video_dir = "video_frames"
-        os.makedirs(video_dir, exist_ok=True)
+        # Create directories
+        video_dir = Path("video_frames")
+        video_dir.mkdir(exist_ok=True)
+        output_dir = Path("predict_outputs")
+        output_dir.mkdir(exist_ok=True)
+
+        # Extract video frames
         ffmpeg_command = (
             f"ffmpeg -i {input_video} -q:v 2 -start_number 0 {video_dir}/%05d.jpg"
         )
         subprocess.run(ffmpeg_command, shell=True, check=True)
 
         frame_names = sorted(
-            [
-                p
-                for p in os.listdir(video_dir)
-                if os.path.splitext(p)[-1].lower() in [".jpg", ".jpeg"]
-            ],
-            key=lambda p: int(os.path.splitext(p)[0]),
+            [p for p in video_dir.glob("*.jpg")], key=lambda p: int(p.stem)
         )
 
         # 3. Initialize SAM predictor
-        inference_state = self.predictor.init_state(video_path=video_dir)
+        inference_state = self.predictor.init_state(video_path=str(video_dir))
 
         # 4. Process clicks and generate prompts
         prompts = {}
@@ -203,9 +202,6 @@ class Predictor(BasePredictor):
                 )
 
         # 7. Generate and yield results
-        output_dir = Path("predict_outputs")
-        output_dir.mkdir(exist_ok=True)
-
         for out_frame_idx in range(0, len(frame_names), output_frame_interval):
             # Combine masks for all objects in the current frame
             combined_mask = np.zeros_like(
@@ -233,9 +229,7 @@ class Predictor(BasePredictor):
                 )
                 fig = plt.figure(figsize=(12, 8))
                 plt.title(f"frame {out_frame_idx}")
-                plt.imshow(
-                    Image.open(os.path.join(video_dir, frame_names[out_frame_idx]))
-                )
+                plt.imshow(Image.open(frame_names[out_frame_idx]))
                 self.show_anns([final_mask], [1])  # Use a single color for all objects
 
                 buf = io.BytesIO()
@@ -250,14 +244,37 @@ class Predictor(BasePredictor):
                 plt.close(fig)
                 yield output_path
 
-        # 8. Cleanup
-        for file in os.listdir(video_dir):
-            os.remove(os.path.join(video_dir, file))
-        os.rmdir(video_dir)
+            elif mask_type == "greenscreen":
+                output_path = (
+                    output_dir
+                    / f"greenscreen_frame_{out_frame_idx:05d}.{output_format}"
+                )
+                # Open the original frame
+                original_frame = Image.open(frame_names[out_frame_idx])
+                # Keep mask in grayscale (mode "L")
+                mask_gray = Image.fromarray(final_mask * 255).convert("L")
+                # Create a green background
+                green_background = Image.new("RGB", original_frame.size, (0, 255, 0))
+                # Use the mask to combine the original frame and green background
+                greenscreen_frame = Image.composite(
+                    original_frame, green_background, mask_gray
+                )
+
+                self.save_image(
+                    greenscreen_frame, output_path, output_format, output_quality
+                )
+                yield output_path
+
+        # Cleanup
+        for file in video_dir.glob("*"):
+            file.unlink()
+        video_dir.rmdir()
 
     def save_image(self, image: Image.Image, path: Path, format: str, quality: int):
         save_params = {"format": format.upper()}
         if format.lower() != "png":
             save_params["quality"] = quality
             save_params["optimize"] = True
+        # Ensure directory exists before saving
+        path.parent.mkdir(parents=True, exist_ok=True)
         image.save(path, **save_params)
