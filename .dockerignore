@@ -9,6 +9,10 @@
 /predict_outputs/
 /video_predictor_example.py
 /video_frames/
+output.*.png
+output.*.webp
+output.*.jpg
+output.*.jpeg
 
 # Exclude Git files
 .git

@@ -3,15 +3,19 @@
 
 
 import os
+import io
 import cv2
 import time
 import torch
+import mimetypes
 import subprocess
 import numpy as np
 from PIL import Image
-from typing import List
+from typing import List, Iterator
 import matplotlib.pyplot as plt
 from cog import BasePredictor, Input, Path, BaseModel
+
+mimetypes.add_type("image/webp", ".webp")
 
 
 DEVICE = "cuda"
@@ -35,11 +39,6 @@ def download_weights(url: str, dest: str) -> None:
         )
         raise
     print("[+] Download completed in: ", time.time() - start, "seconds")
-
-
-class Output(BaseModel):
-    black_white_masks: List[Path]
-    highlighted_frames: List[Path]
 
 
 class Predictor(BasePredictor):
@@ -131,11 +130,26 @@ class Predictor(BasePredictor):
             default=1,
             description="Interval for output frame visualization (1 = every frame, 2 = every other frame, etc.)",
         ),
-    ) -> Output:
+        mask_type: str = Input(
+            default="binary",
+            choices=["binary", "highlighted"],
+            description="Choose the type of mask to return (binary or highlighted frames)",
+        ),
+        output_format: str = Input(
+            description="The image file format of the generated output images",
+            choices=["webp", "jpg", "png"],
+            default="webp",
+        ),
+        output_quality: int = Input(
+            description="The image compression quality (for lossy formats like JPEG and WebP). 100 = best quality, 0 = lowest quality.",
+            default=80,
+            ge=0,
+            le=100,
+        ),
+    ) -> Iterator[Path]:
 
         video_dir = "video_frames"
         os.makedirs(video_dir, exist_ok=True)
-
         ffmpeg_command = (
             f"ffmpeg -i {input_video} -q:v 2 -start_number 0 {video_dir}/%05d.jpg"
         )
@@ -198,17 +212,6 @@ class Predictor(BasePredictor):
                     video_segments[frame] = {}
                 video_segments[frame][obj_id] = out_mask_logits[0].cpu().numpy()
 
-                # Visualize each step
-                fig = plt.figure(figsize=(12, 8))
-                plt.title(f"frame {frame}, object {obj_id}")
-                plt.imshow(Image.open(os.path.join(video_dir, frame_names[frame])))
-                self.show_points(points, labels, plt.gca())
-                self.show_anns([(out_mask_logits[0] > 0.0).cpu().numpy()], [obj_id])
-
-                step_output = output_dir / f"step_obj{obj_id}_frame_{frame}.png"
-                plt.savefig(step_output, bbox_inches="tight", pad_inches=0)
-                plt.close(fig)
-
         # Propagate masks
         for (
             out_frame_idx,
@@ -222,14 +225,8 @@ class Predictor(BasePredictor):
                     out_mask_logits[i].cpu().numpy()
                 )
 
-        # Visualize results
-        black_white_masks = []
-        highlighted_frames = []
+        # Generate and yield results
         for out_frame_idx in range(0, len(frame_names), output_frame_interval):
-            fig = plt.figure(figsize=(12, 8))
-            plt.title(f"frame {out_frame_idx}")
-            plt.imshow(Image.open(os.path.join(video_dir, frame_names[out_frame_idx])))
-
             combined_mask = np.zeros_like(
                 next(iter(video_segments[out_frame_idx].values())).squeeze(),
                 dtype=np.float32,
@@ -241,30 +238,48 @@ class Predictor(BasePredictor):
             # Apply threshold to get final binary mask
             final_mask = (combined_mask > 0.0).astype(np.uint8)
 
-            for obj_id, obj_prompts in prompts.items():
-                for frame, points, labels in obj_prompts:
-                    if frame == out_frame_idx:
-                        self.show_points(points, labels, plt.gca())
+            if mask_type == "binary":
+                output_path = (
+                    output_dir / f"binary_mask_{out_frame_idx:05d}.{output_format}"
+                )
+                mask_image = Image.fromarray(final_mask * 255)
+                self.save_image(mask_image, output_path, output_format, output_quality)
+                yield output_path
 
-            bw_mask_path = output_dir / f"bw_mask_{out_frame_idx:05d}.png"
-            Image.fromarray(final_mask * 255).save(bw_mask_path)
-            black_white_masks.append(bw_mask_path)
+            elif mask_type == "highlighted":
+                output_path = (
+                    output_dir
+                    / f"highlighted_frame_{out_frame_idx:05d}.{output_format}"
+                )
+                fig = plt.figure(figsize=(12, 8))
+                plt.title(f"frame {out_frame_idx}")
+                plt.imshow(
+                    Image.open(os.path.join(video_dir, frame_names[out_frame_idx]))
+                )
+                self.show_anns([final_mask], [1])  # Use a single color for all objects
 
-            # Show the mask on the image
-            self.show_anns([final_mask], [1])  # Use a single color for all objects
+                # Save figure to a bytes buffer
+                buf = io.BytesIO()
+                plt.savefig(
+                    buf, format="png", dpi="figure", bbox_inches="tight", pad_inches=0
+                )
+                buf.seek(0)
 
-            highlighted_frame_path = (
-                output_dir / f"highlighted_frame_{out_frame_idx:05d}.png"
-            )
-            plt.savefig(highlighted_frame_path, bbox_inches="tight", pad_inches=0)
-            plt.close(fig)
-            highlighted_frames.append(highlighted_frame_path)
+                # Open the buffer with PIL and save with desired format and quality
+                img = Image.open(buf)
+                self.save_image(img, output_path, output_format, output_quality)
 
-        cleanup_start = time.time()
+                plt.close(fig)
+                yield output_path
+
+        # Cleanup
         for file in os.listdir(video_dir):
             os.remove(os.path.join(video_dir, file))
         os.rmdir(video_dir)
 
-        return Output(
-            black_white_masks=black_white_masks, highlighted_frames=highlighted_frames
-        )
+    def save_image(self, image: Image.Image, path: Path, format: str, quality: int):
+        save_params = {"format": format.upper()}
+        if format.lower() != "png":
+            save_params["quality"] = quality
+            save_params["optimize"] = True
+        image.save(path, **save_params)
