@@ -96,51 +96,45 @@ class Predictor(BasePredictor):
         click_frames: str,
         click_object_ids: str,
     ) -> tuple:
+        click_coordinates = click_coordinates.replace(" ", "")
+        click_labels = click_labels.replace(" ", "")
+        click_frames = click_frames.replace(" ", "")
+        click_object_ids = click_object_ids.replace(" ", "")
+
         # Parse click coordinates
         click_list = [
-            list(map(int, map(str.strip, click.strip()[1:-1].split(","))))
-            for click in click_coordinates.strip().strip("[]").split("],")
+            list(map(int, click.replace(" ", "").split(",")))
+            for click in click_coordinates.strip("[]").split("],[")
         ]
         num_clicks = len(click_list)
 
         # Handle click labels
-        # Strip whitespace and split by comma, then extend if necessary
-        click_labels_list = [label.strip() for label in click_labels.split(",")]
-        click_labels_list = (
-            click_labels_list
-            * ((num_clicks + len(click_labels_list) - 1) // len(click_labels_list))
-        )[:num_clicks]
+        click_labels_list = list(map(int, click_labels.split(",")))
+        click_labels_list = click_labels_list * (
+            num_clicks // len(click_labels_list) + 1
+        )
+        click_labels_list = click_labels_list[:num_clicks]
 
         # Handle click frames
-        # Strip whitespace and split by comma, use default '0' if not provided, then extend if necessary
         click_frames_list = (
-            [frame.strip() for frame in click_frames.split(",")]
+            list(map(int, click_frames.split(",")))
             if click_frames
-            else ["0"] * num_clicks
+            else [0] * num_clicks
         )
-        click_frames_list = (
-            click_frames_list
-            * ((num_clicks + len(click_frames_list) - 1) // len(click_frames_list))
-        )[:num_clicks]
+        click_frames_list = click_frames_list * (
+            num_clicks // len(click_frames_list) + 1
+        )
+        click_frames_list = click_frames_list[:num_clicks]
 
         # Handle click object IDs
         if click_object_ids:
-            # Strip whitespace from each object ID
-            object_ids_list = [obj_id.strip() for obj_id in click_object_ids.split(",")]
-            # If not enough object IDs provided, extend with sequential labels
-            if len(object_ids_list) < num_clicks:
-                object_ids_list.extend(
-                    f"object_{i}"
-                    for i in range(len(object_ids_list) + 1, num_clicks + 1)
-                )
+            object_ids_list = click_object_ids.split(",")
         else:
-            # If no object IDs provided, generate sequential labels
             object_ids_list = [f"object_{i}" for i in range(1, num_clicks + 1)]
+        object_ids_list = object_ids_list * (num_clicks // len(object_ids_list) + 1)
         object_ids_list = object_ids_list[:num_clicks]
 
         # Map string labels to unique integer IDs
-        # This is necessary because the underlying algorithm requires integer IDs,
-        # but we want to allow users to input meaningful string labels
         label_to_id = {}
         id_counter = 1
         object_ids_int_list = []
@@ -150,23 +144,15 @@ class Predictor(BasePredictor):
                 id_counter += 1
             object_ids_int_list.append(label_to_id[label])
 
-        # Convert all inputs to appropriate types
-        # Ensure all data is in the correct format for processing
-        click_list = [list(map(int, coords)) for coords in click_list]
-        click_labels_list = list(map(int, click_labels_list))
-        click_frames_list = list(map(int, click_frames_list))
+        return (click_list, click_labels_list, click_frames_list, object_ids_int_list)
 
-        # Validation
-        # Ensure all input lists have the same length to prevent inconsistencies in processing
-        if not (
-            len(click_list)
-            == len(click_labels_list)
-            == len(click_frames_list)
-            == len(object_ids_list)
-        ):
-            raise ValueError(
-                "Mismatch in the number of clicks, click types, click frames, or object IDs."
-            )
+    def save_image(self, image: Image.Image, path: Path, format: str, quality: int):
+        save_params = {"format": format.upper()}
+        if format.lower() != "png":
+            save_params["quality"] = quality
+            save_params["optimize"] = True
+        path.parent.mkdir(parents=True, exist_ok=True)
+        image.save(path, **save_params)
 
     def predict(
         self,
@@ -233,6 +219,15 @@ class Predictor(BasePredictor):
             )
         )
 
+        # Print parsed inputs for clarity
+        print("\nParsed Inputs:")
+        print("==============")
+        print(f"Click Coordinates: {click_list}")
+        print(f"Click Labels: {click_labels_list}")
+        print(f"Click Frames: {click_frames_list}")
+        print(f"Object IDs: {object_ids_int_list}")
+        print("==============\n")
+
         # 2. Create directories
         video_dir = Path("video_frames")
         video_dir.mkdir(exist_ok=True)
@@ -241,7 +236,10 @@ class Predictor(BasePredictor):
 
         # 3. Extract video frames
         ffmpeg_command = (
-            f"ffmpeg -i {input_video} -q:v 2 -start_number 0 {video_dir}/%05d.jpg"
+            f"ffmpeg -hwaccel cuda -i {input_video} "
+            f"-vf 'scale=trunc(iw/2)*2:trunc(ih/2)*2' "
+            f"-q:v 2 -start_number 0 -vsync 0 "
+            f"{video_dir}/%05d.jpg"
         )
         subprocess.run(ffmpeg_command, shell=True, check=True)
 
@@ -317,6 +315,11 @@ class Predictor(BasePredictor):
             )
 
         for out_frame_idx in range(0, len(frame_names), output_frame_interval):
+            # Check if the current frame has any segments
+            if out_frame_idx not in video_segments or not video_segments[out_frame_idx]:
+                print(f"Warning: No segments found for frame {out_frame_idx}. Skipping...")
+                continue
+
             # Combine masks for all objects in the current frame
             combined_mask = np.zeros_like(
                 next(iter(video_segments[out_frame_idx].values())).squeeze(),
@@ -369,11 +372,3 @@ class Predictor(BasePredictor):
         for file in video_dir.glob("*"):
             file.unlink()
         video_dir.rmdir()
-
-    def save_image(self, image: Image.Image, path: Path, format: str, quality: int):
-        save_params = {"format": format.upper()}
-        if format.lower() != "png":
-            save_params["quality"] = quality
-            save_params["optimize"] = True
-        path.parent.mkdir(parents=True, exist_ok=True)
-        image.save(path, **save_params)
