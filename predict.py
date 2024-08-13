@@ -91,59 +91,130 @@ class Predictor(BasePredictor):
 
     def predict(
         self,
-        input_video: Path = Input(description="Path to the input video file"),
+        input_video: Path = Input(description="Input video file path"),
+        # Segmentation inputs
         click_coordinates: str = Input(
-            description="List of click coordinates in format '[x,y],[x,y],...'"
+            description="Click coordinates as '[x,y],[x,y],...'. Determines number of clicks."
         ),
         click_labels: str = Input(
-            description="List of click types (1 for foreground, 0 for background), e.g., '1,1,0,1'"
+            description="Click types (1=foreground, 0=background) as '1,1,0,1'. Auto-extends if shorter than coordinates.",
+            default="1",
         ),
         click_frames: str = Input(
-            description="List of frame indices for each click, e.g., '0,0,150,0'"
+            description="Frame indices for clicks as '0,0,150,0'. Auto-extends if shorter than coordinates.",
+            default="0",
         ),
         click_object_ids: str = Input(
-            description="List of object IDs for each click, e.g., '1,1,1,2'"
+            description="Object labels for clicks as 'person,dog,cat'. Auto-generates if missing or incomplete.",
+            default="",
         ),
-        output_frame_interval: int = Input(
-            default=1, description="Interval for output frame visualization"
-        ),
+        # Output type
         mask_type: str = Input(
             default="binary",
             choices=["binary", "highlighted", "greenscreen"],
-            description="Choose the type of mask to return",
+            description="Mask type: binary (B&W), highlighted (colored overlay), or greenscreen",
         ),
+        # Output format
+        output_video: bool = Input(
+            default=False,
+            description="True for video output, False for image sequence",
+        ),
+        # Video-specific options
+        video_fps: int = Input(
+            description="Video output frame rate (ignored for image sequence)",
+            default=30,
+            ge=1,
+            le=60,
+        ),
+        # Image sequence-specific options
         output_format: str = Input(
-            description="The output format (Image or Video)",
-            choices=["webp", "jpg", "png", "mp4"],
+            description="Image format for sequence (ignored for video)",
+            choices=["webp", "jpg", "png"],
             default="webp",
         ),
         output_quality: int = Input(
-            description="The image compression quality (for image outputs)",
+            description="JPG/WebP compression quality (0-100, ignored for PNG and video)",
             default=80,
             ge=0,
             le=100,
         ),
-        video_fps: int = Input(
-            description="Frames per second for video output", default=30, ge=1, le=60
+        # General output option
+        output_frame_interval: int = Input(
+            default=1,
+            description="Output every Nth frame. 1=all frames, 2=every other, etc.",
         ),
     ) -> Iterator[Path]:
         # 1. Parse inputs
+        # Parse click coordinates
         click_list = [
-            list(map(int, click.split(",")))
-            for click in click_coordinates.strip("[]").split("],[")
+            list(map(int, map(str.strip, click.strip()[1:-1].split(","))))
+            for click in click_coordinates.strip().strip("[]").split("],")
         ]
-        click_type_list = list(map(int, click_labels.split(",")))
-        frame_list = list(map(int, click_frames.split(",")))
-        obj_id_list = list(map(int, click_object_ids.split(",")))
+        num_clicks = len(click_list)
 
+        # Handle click labels
+        # Strip whitespace and split by comma, then extend if necessary
+        click_labels_list = [label.strip() for label in click_labels.split(",")]
+        click_labels_list = (
+            click_labels_list
+            * ((num_clicks + len(click_labels_list) - 1) // len(click_labels_list))
+        )[:num_clicks]
+
+        # Handle click frames
+        # Strip whitespace and split by comma, use default '0' if not provided, then extend if necessary
+        click_frames_list = (
+            [frame.strip() for frame in click_frames.split(",")]
+            if click_frames
+            else ["0"] * num_clicks
+        )
+        click_frames_list = (
+            click_frames_list
+            * ((num_clicks + len(click_frames_list) - 1) // len(click_frames_list))
+        )[:num_clicks]
+
+        # Handle click object IDs
+        if click_object_ids:
+            # Strip whitespace from each object ID
+            object_ids_list = [obj_id.strip() for obj_id in click_object_ids.split(",")]
+            # If not enough object IDs provided, extend with sequential labels
+            if len(object_ids_list) < num_clicks:
+                object_ids_list.extend(
+                    f"object_{i}"
+                    for i in range(len(object_ids_list) + 1, num_clicks + 1)
+                )
+        else:
+            # If no object IDs provided, generate sequential labels
+            object_ids_list = [f"object_{i}" for i in range(1, num_clicks + 1)]
+        object_ids_list = object_ids_list[:num_clicks]
+
+        # Map string labels to unique integer IDs
+        # This is necessary because the underlying algorithm requires integer IDs,
+        # but we want to allow users to input meaningful string labels
+        label_to_id = {}
+        id_counter = 1
+        object_ids_int_list = []
+        for label in object_ids_list:
+            if label not in label_to_id:
+                label_to_id[label] = id_counter
+                id_counter += 1
+            object_ids_int_list.append(label_to_id[label])
+
+        # Convert all inputs to appropriate types
+        # Ensure all data is in the correct format for processing
+        click_list = [list(map(int, coords)) for coords in click_list]
+        click_labels_list = list(map(int, click_labels_list))
+        click_frames_list = list(map(int, click_frames_list))
+
+        # Validation
+        # Ensure all input lists have the same length to prevent inconsistencies in processing
         if not (
             len(click_list)
-            == len(click_type_list)
-            == len(frame_list)
-            == len(obj_id_list)
+            == len(click_labels_list)
+            == len(click_frames_list)
+            == len(object_ids_list)
         ):
             raise ValueError(
-                "The number of clicks, click types, click frames, and object IDs must be the same."
+                "Mismatch in the number of clicks, click types, click frames, or object IDs."
             )
 
         # 2. Create directories
@@ -168,7 +239,7 @@ class Predictor(BasePredictor):
         # 5. Process clicks and generate prompts
         prompts = {}
         for click, click_type, frame, obj_id in zip(
-            click_list, click_type_list, frame_list, obj_id_list
+            click_list, click_labels_list, click_frames_list, object_ids_int_list
         ):
             x, y = click
             points = np.array([[x, y]], dtype=np.float32)
@@ -208,7 +279,9 @@ class Predictor(BasePredictor):
                 )
 
         # 8. Generate and yield results
-        is_video_output = output_format == "mp4"
+        is_video_output = output_video
+        if is_video_output:
+            output_format = "mp4"
         output_dir = Path("predict_outputs")
         output_dir.mkdir(exist_ok=True)
 
@@ -216,7 +289,7 @@ class Predictor(BasePredictor):
             # Open the first frame to get its dimensions
             first_frame = Image.open(frame_names[0])
             frame_width, frame_height = first_frame.size
-            
+
             video_output_path = output_dir / f"output_video.{output_format}"
             ffmpeg_command = (
                 f"ffmpeg -y -f rawvideo -vcodec rawvideo -pix_fmt rgb24 "

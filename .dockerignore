@@ -9,6 +9,7 @@
 /predict_outputs/
 /video_predictor_example.py
 /video_frames/
+output.*.mp4
 output.*.png
 output.*.webp
 output.*.jpg
