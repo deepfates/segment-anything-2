@@ -89,62 +89,13 @@ class Predictor(BasePredictor):
             img[m] = color
         ax.imshow(img)
 
-    def predict(
+    def parse_inputs(
         self,
-        input_video: Path = Input(description="Input video file path"),
-        # Segmentation inputs
-        click_coordinates: str = Input(
-            description="Click coordinates as '[x,y],[x,y],...'. Determines number of clicks."
-        ),
-        click_labels: str = Input(
-            description="Click types (1=foreground, 0=background) as '1,1,0,1'. Auto-extends if shorter than coordinates.",
-            default="1",
-        ),
-        click_frames: str = Input(
-            description="Frame indices for clicks as '0,0,150,0'. Auto-extends if shorter than coordinates.",
-            default="0",
-        ),
-        click_object_ids: str = Input(
-            description="Object labels for clicks as 'person,dog,cat'. Auto-generates if missing or incomplete.",
-            default="",
-        ),
-        # Output type
-        mask_type: str = Input(
-            default="binary",
-            choices=["binary", "highlighted", "greenscreen"],
-            description="Mask type: binary (B&W), highlighted (colored overlay), or greenscreen",
-        ),
-        # Output format
-        output_video: bool = Input(
-            default=False,
-            description="True for video output, False for image sequence",
-        ),
-        # Video-specific options
-        video_fps: int = Input(
-            description="Video output frame rate (ignored for image sequence)",
-            default=30,
-            ge=1,
-            le=60,
-        ),
-        # Image sequence-specific options
-        output_format: str = Input(
-            description="Image format for sequence (ignored for video)",
-            choices=["webp", "jpg", "png"],
-            default="webp",
-        ),
-        output_quality: int = Input(
-            description="JPG/WebP compression quality (0-100, ignored for PNG and video)",
-            default=80,
-            ge=0,
-            le=100,
-        ),
-        # General output option
-        output_frame_interval: int = Input(
-            default=1,
-            description="Output every Nth frame. 1=all frames, 2=every other, etc.",
-        ),
-    ) -> Iterator[Path]:
-        # 1. Parse inputs
+        click_coordinates: str,
+        click_labels: str,
+        click_frames: str,
+        click_object_ids: str,
+    ) -> tuple:
         # Parse click coordinates
         click_list = [
             list(map(int, map(str.strip, click.strip()[1:-1].split(","))))
@@ -216,6 +167,71 @@ class Predictor(BasePredictor):
             raise ValueError(
                 "Mismatch in the number of clicks, click types, click frames, or object IDs."
             )
+
+    def predict(
+        self,
+        input_video: Path = Input(description="Input video file path"),
+        # Segmentation inputs
+        click_coordinates: str = Input(
+            description="Click coordinates as '[x,y],[x,y],...'. Determines number of clicks."
+        ),
+        click_labels: str = Input(
+            description="Click types (1=foreground, 0=background) as '1,1,0,1'. Auto-extends if shorter than coordinates.",
+            default="1",
+        ),
+        click_frames: str = Input(
+            description="Frame indices for clicks as '0,0,150,0'. Auto-extends if shorter than coordinates.",
+            default="0",
+        ),
+        click_object_ids: str = Input(
+            description="Object labels for clicks as 'person,dog,cat'. Auto-generates if missing or incomplete.",
+            default="",
+        ),
+        # Output type
+        mask_type: str = Input(
+            default="binary",
+            choices=["binary", "highlighted", "greenscreen"],
+            description="Mask type: binary (B&W), highlighted (colored overlay), or greenscreen",
+        ),
+        # Output format
+        output_video: bool = Input(
+            default=False,
+            description="True for video output, False for image sequence",
+        ),
+        # Video-specific options
+        video_fps: int = Input(
+            description="Video output frame rate (ignored for image sequence)",
+            default=30,
+            ge=1,
+            le=60,
+        ),
+        # Image sequence-specific options
+        output_format: str = Input(
+            description="Image format for sequence (ignored for video)",
+            choices=["webp", "jpg", "png"],
+            default="webp",
+        ),
+        output_quality: int = Input(
+            description="JPG/WebP compression quality (0-100, ignored for PNG and video)",
+            default=80,
+            ge=0,
+            le=100,
+        ),
+        # General output option
+        output_frame_interval: int = Input(
+            default=1,
+            description="Output every Nth frame. 1=all frames, 2=every other, etc.",
+        ),
+    ) -> Iterator[Path]:
+        # 1. Parse inputs
+        click_list, click_labels_list, click_frames_list, object_ids_int_list = (
+            self.parse_inputs(
+                click_coordinates,
+                click_labels,
+                click_frames,
+                click_object_ids,
+            )
+        )
 
         # 2. Create directories
         video_dir = Path("video_frames")
