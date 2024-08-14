@@ -29,7 +29,8 @@ build:
     - "black==24.2.0"
     - "usort==1.0.2"
     - "ufmt==2.0.0b2"
-    - "jupyter" # TODO: Remove later
+    - "supervision"
+    - "tqdm"
 
   # commands run after the environment is setup
   run:
