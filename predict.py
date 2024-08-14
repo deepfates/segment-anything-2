@@ -175,6 +175,11 @@ class Predictor(BasePredictor):
             choices=["binary", "highlighted", "greenscreen"],
             description="Mask type: binary (B&W), highlighted (colored overlay), or greenscreen",
         ),
+        annotation_type: str = Input(
+            default="mask",
+            choices=["mask", "box", "both"],
+            description="Annotation type: mask only, bounding box only, or both (ignored for binary and greenscreen)",
+        ),
         # Output format
         output_video: bool = Input(
             default=False,
@@ -269,7 +274,7 @@ class Predictor(BasePredictor):
                         continue
 
                     annotated_frame = self.process_frame(
-                        frame, mask_logits, tracker_ids, mask_type
+                        frame, mask_logits, tracker_ids, mask_type, annotation_type
                     )
                     frame_path = frame_directory_path / f"frame_{frame_idx:05d}.png"
                     Image.fromarray(annotated_frame).save(frame_path)
@@ -282,7 +287,12 @@ class Predictor(BasePredictor):
                 ffmpeg_command = (
                     f"ffmpeg -y -f rawvideo -vcodec rawvideo -pix_fmt rgb24 "
                     f"-s {frame_width}x{frame_height} -r {video_fps} "
-                    f"-i - -c:v libx264 -pix_fmt yuv420p -preset fast -crf 23 {video_path}"
+                    f"-i - -c:v h264_nvenc -preset p7 -tune hq "
+                    f"-rc vbr -cq 10 -qmin 10 -qmax 20 "
+                    f"-b:v 0 -maxrate:v 200M -bufsize 200M "
+                    f"-profile:v high -pix_fmt yuv420p "
+                    f"-gpu 0 -rc-lookahead 32 -temporal-aq 1 -aq-strength 15 "
+                    f"{video_path}"
                 )
                 ffmpeg_process = subprocess.Popen(
                     ffmpeg_command.split(),
@@ -314,7 +324,7 @@ class Predictor(BasePredictor):
                         continue
 
                     annotated_frame = self.process_frame(
-                        frame, mask_logits, tracker_ids, mask_type
+                        frame, mask_logits, tracker_ids, mask_type, annotation_type
                     )
                     output_path = output_dir / f"frame_{frame_idx:05d}.{output_format}"
                     self.save_image(
@@ -325,7 +335,9 @@ class Predictor(BasePredictor):
                     )
                     yield output_path
 
-    def process_frame(self, frame, mask_logits, tracker_ids, mask_type):
+    def process_frame(
+        self, frame, mask_logits, tracker_ids, mask_type, annotation_type
+    ):
         masks = (mask_logits > 0.0).cpu().numpy().astype(bool)
         if len(masks.shape) == 4:
             masks = np.squeeze(masks, axis=1)
@@ -337,12 +349,15 @@ class Predictor(BasePredictor):
         )
 
         if mask_type == "highlighted":
-            annotated_frame = self.mask_annotator.annotate(
-                scene=frame.copy(), detections=detections
-            )
-            annotated_frame = self.box_annotator.annotate(
-                scene=annotated_frame, detections=detections
-            )
+            annotated_frame = frame.copy()
+            if annotation_type in ["mask", "both"]:
+                annotated_frame = self.mask_annotator.annotate(
+                    scene=annotated_frame, detections=detections
+                )
+            if annotation_type in ["box", "both"]:
+                annotated_frame = self.box_annotator.annotate(
+                    scene=annotated_frame, detections=detections
+                )
         elif mask_type == "binary":
             annotated_frame = (masks.any(axis=0) * 255).astype(np.uint8)
         elif mask_type == "greenscreen":
