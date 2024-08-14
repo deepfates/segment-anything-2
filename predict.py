@@ -259,20 +259,53 @@ class Predictor(BasePredictor):
             frames_generator = sv.get_video_frames_generator(str(input_video))
 
             if output_video:
-                video_path = output_dir / f"output_{os.urandom(4).hex()}.mp4"
-                with sv.VideoSink(str(video_path), video_info=video_info) as sink:
-                    for frame_idx, (frame, (_, tracker_ids, mask_logits)) in enumerate(
-                        zip(frames_generator, masks_generator)
-                    ):
-                        if frame_idx % output_frame_interval != 0:
-                            continue
+                video_path = output_dir / "output_video.mp4"
+                frame_paths = []
 
-                        annotated_frame = self.process_frame(
-                            frame, mask_logits, tracker_ids, mask_type
-                        )
-                        sink.write_frame(annotated_frame)
+                for frame_idx, (frame, (_, tracker_ids, mask_logits)) in enumerate(
+                    zip(frames_generator, masks_generator)
+                ):
+                    if frame_idx % output_frame_interval != 0:
+                        continue
+
+                    annotated_frame = self.process_frame(
+                        frame, mask_logits, tracker_ids, mask_type
+                    )
+                    frame_path = frame_directory_path / f"frame_{frame_idx:05d}.png"
+                    Image.fromarray(annotated_frame).save(frame_path)
+                    frame_paths.append(frame_path)
+
+                # Use FFmpeg to create the video
+                first_frame = Image.open(frame_paths[0])
+                frame_width, frame_height = first_frame.size
+
+                ffmpeg_command = (
+                    f"ffmpeg -y -f rawvideo -vcodec rawvideo -pix_fmt rgb24 "
+                    f"-s {frame_width}x{frame_height} -r {video_fps} "
+                    f"-i - -c:v libx264 -pix_fmt yuv420p -preset fast -crf 23 {video_path}"
+                )
+                ffmpeg_process = subprocess.Popen(
+                    ffmpeg_command.split(),
+                    stdin=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                for frame_path in frame_paths:
+                    with Image.open(frame_path) as img:
+                        frame_data = np.array(img.convert("RGB"))
+                        # Convert BGR to RGB
+                        frame_data = frame_data[:, :, ::-1]
+                        ffmpeg_process.stdin.write(frame_data.tobytes())
+
+                ffmpeg_process.stdin.close()
+                ffmpeg_process.wait()
+
+                # Clean up temporary frame files
+                for frame_path in frame_paths:
+                    frame_path.unlink()
 
                 yield video_path
+
             else:
                 for frame_idx, (frame, (_, tracker_ids, mask_logits)) in enumerate(
                     zip(frames_generator, masks_generator)
